@@ -1,2 +1,8 @@
 .omc/
 CLAUDE.md
+
+# 설계/노트 파일 (깃에 올리지 않음)
+GPT_DESIGN.md
+claude_DESIGN_DRAFT.md
+claude_DESIGN_STUDY.md
+claude_SEED_NOTES.md
