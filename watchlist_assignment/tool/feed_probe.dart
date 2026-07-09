@@ -1,12 +1,9 @@
-// 과제 분석용 1회성 프로브. seed를 수정하지 않고 구독자 입장에서 feed 특성을 실측한다.
-// 실행: dart run tool/feed_probe.dart
 import '../lib/seed/market_feed.dart';
 import '../lib/seed/market_models.dart';
 
 Future<void> main() async {
   final feed = MarketFeed();
 
-  // 유니버스 특성
   final symbols = feed.symbols;
   final names = symbols.map((s) => s.name).toSet();
   final snapshot = feed.initialSnapshot();
@@ -17,7 +14,6 @@ Future<void> main() async {
   print('코드 범위: ${symbols.first.code} ~ ${symbols.last.code}');
   print('가격 범위: ${prices.first} ~ ${prices.last}');
 
-  // tick 스트림 실측 (10초 분량 = 600배치)
   var batches = 0, ticks = 0, halted = 0, outOfOrder = 0, errors = 0;
   var minBatch = 1 << 30, maxBatch = 0;
   final lastTs = <String, int>{};
@@ -45,7 +41,7 @@ Future<void> main() async {
   }, onError: (_) => errors++);
 
   feed.pump(600);
-  // StreamController는 이벤트를 비동기 전달하므로, 전달이 끝날 때까지 루프를 넘긴다.
+
   await Future<void>.delayed(Duration.zero);
 
   final counts = updateCount.values.toList()..sort();
@@ -60,7 +56,6 @@ Future<void> main() async {
   print('종목당 갱신 횟수: 중앙값 ${counts[counts.length ~/ 2]}, min ${counts.first}, max ${counts.last}');
   print('→ 평균 갱신 간격: ${(10000 / (ticks / symbols.length)).toStringAsFixed(0)}ms/종목');
 
-  // 에러 옵션을 켰을 때 구독 생존 확인
   final errFeed = MarketFeed(transientErrorProbability: 0.1);
   var errCount = 0, batchAfterErr = 0, sawErr = false;
   errFeed.ticks.listen((b) {
