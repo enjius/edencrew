@@ -23,7 +23,7 @@
 | 검색 | 시작 시 인덱스 1회 구축 + 입력 debounce | 필터 조건은 불변 메타데이터에만 의존하므로 tick 경로와 분리한다. |
 | 필터 시 요약 | 표시 종목 수만 필터 기준, 시총·Top-20은 전체 기준 | 검색은 목록 필터, 요약은 전체 관심종목 지표로 역할을 분리한다. |
 | 거래정지 | 목록 유지 + 정지 배지 표시 + 집계 포함 | 관심종목에서 사라지는 것보다 정지 상태를 보여주는 편이 사용자에게 자연스럽다. |
-| 상세 화면 | 시간 허용 시 구현, 부족하면 설계로 대체 | 과제 우선순위는 화면 1과 문서다. |
+| 상세 화면 | 구현 완료 (스파크라인 포함) | 같은 store의 선택 종목 셀 하나만 listen해 목록 갱신 비용과 분리한다. |
 
 ## 3. 계층 구조
 
@@ -33,17 +33,21 @@ lib/
   data/
     market_repository.dart   feed 생성, snapshot 로드, ticks 구독, 에러 전달
   domain/
-    quote_state.dart         종목별 상태와 파생값
-    watchlist_store.dart     tick 반영, timestamp 가드, notifier 관리
+    quote_state.dart         종목별 상태와 파생값, 셀 단위 notifier와 timestamp 가드
+    watchlist_store.dart     tick 반영, 집계/검색 조율, notifier 관리
     aggregates.dart          시총 증분 집계, Top-20 계산
     search_index.dart        초성/부분일치/코드 검색 인덱스
   ui/
-    watchlist_page.dart
+    watchlist_page.dart      단일 스크롤(급상승 섹션 + 전체 목록), 검색, 오류 배너
     quote_row.dart
     summary_bar.dart
-    top_movers_strip.dart
+    top_movers_section.dart  급상승 Top-20 세로 순위 섹션(더보기 접힘)
     detail_page.dart
     sparkline.dart
+  baseline/
+    naive_watchlist_page.dart  성능 비교용 순진한 구현(PERF.md)
+integration_test/perf_test.dart  기기 profile 프레임 측정
+test_driver/perf_driver.dart     flutter drive 진입점
 ```
 
 경계 원칙은 다음과 같다.
@@ -73,6 +77,7 @@ MarketFeed 생성
 class QuoteState {
   final String code;
   final String name;
+  final MarketType market;
   final int listedShares;
   final double previousClose;
 
@@ -80,10 +85,17 @@ class QuoteState {
   int dayVolume;
   int lastTimestampMs;
   QuoteStatus status;
+
+  // 구독 시작 이후 관측된 고가/저가 (상세 화면용, 매 tick 갱신).
+  double dayHigh;
+  double dayLow;
 }
 ```
 
 `QuoteState`는 종목별 mutable cell로 사용한다. `ValueNotifier<QuoteState>`에 같은 객체를 다시 대입하면 identity가 같아 통지가 발생하지 않으므로 사용하지 않는다. 대신 종목별 커스텀 `ChangeNotifier`를 둔다.
+
+역순 tick 가드는 셀 안에 캡슐화한다. 셀은 자기가 마지막으로 반영한 시각보다
+오래된 tick을 스스로 거부하므로, store는 배분만 하고 과거 tick 판단은 셀이 맡는다.
 
 ```dart
 class QuoteCell extends ChangeNotifier {
@@ -92,7 +104,22 @@ class QuoteCell extends ChangeNotifier {
   final QuoteState state;
 
   bool applyTick(QuoteTick tick) {
-    final changed = state.apply(tick);
+    final s = state;
+    if (tick.timestampMs < s.lastTimestampMs) {
+      return false; // 늦게 도착한 과거 tick — 무시한다.
+    }
+    final priceChanged = tick.price != s.price;
+    final volumeChanged = tick.dayVolume != s.dayVolume;
+    final statusChanged = tick.status != s.status;
+
+    s.lastTimestampMs = tick.timestampMs;
+    s.price = tick.price;
+    s.dayVolume = tick.dayVolume;
+    s.status = tick.status;
+    if (tick.price > s.dayHigh) s.dayHigh = tick.price;
+    if (tick.price < s.dayLow) s.dayLow = tick.price;
+
+    final changed = priceChanged || volumeChanged || statusChanged;
     if (changed) notifyListeners();
     return changed;
   }
@@ -101,22 +128,22 @@ class QuoteCell extends ChangeNotifier {
 
 이 구조는 상태 객체를 매 tick 새로 만들지 않으면서도, 실제 표시값이 바뀐 경우에만 명시적으로 행 rebuild를 유발한다.
 
-tick 처리 규칙:
+store의 배치 처리는 집계에 필요한 이전 가격만 셀 밖에서 관측한다.
 
 ```dart
 for (final tick in batch) {
-  final cell = store.cellFor(tick.code);
-  final state = cell.state;
-  if (tick.timestampMs < state.lastTimestampMs) {
-    continue; // 늦게 도착한 과거 tick 무시
-  }
+  final cell = _cells[tick.code];
+  if (cell == null) continue;
 
+  final state = cell.state;
   final oldPrice = state.price;
-  final changed = cell.applyTick(tick);
+  final changed = cell.applyTick(tick); // 가드는 이 안에서 처리
   if (!changed) continue;
 
-  aggregates.onPriceChanged(oldPrice, state.price, state.listedShares);
-  summaryScheduler.markDirty();
+  if (state.price != oldPrice) {
+    _aggregates.onPriceChanged(oldPrice, state.price, state.listedShares);
+  }
+  _summaryDirty = true;
 }
 ```
 
@@ -139,7 +166,8 @@ for (final tick in batch) {
 | 대상 | 주기 | 구현 | 근거 |
 |---|---|---|---|
 | 개별 행 가격·거래량·상태 | batch 처리 직후 즉시 | 종목별 `QuoteCell extends ChangeNotifier` | 보이는 행만 listen하므로 비용이 작고 신선도 조건을 만족한다. |
-| 시총 합계·Top-20·오류 배너 | 100ms | 별도 summary notifier | 공통 위젯의 60Hz rebuild를 피한다. |
+| 시총 합계·Top-20 | 100ms | 별도 summary notifier | 공통 위젯의 60Hz rebuild를 피한다. |
+| 오류 배너 | 에러 발생 즉시 표시, 3초 후 자동 해제 | summary notifier + 타이머 | 에러는 드물어 즉시 반영해도 비용이 없고, 최소 표시 시간을 보장한다. |
 | 검색 필터 | 입력 debounce 후 | 검색 인덱스에서 재계산 | 종목명/코드는 불변이라 tick과 무관하다. |
 
 Flutter 레벨 수단:
@@ -228,6 +256,9 @@ for quote in allQuotes:
 - 목록: 검색 필터를 통과한 종목만 표시
 - 시총 합계: 전체 관심종목 기준
 - Top-20: 전체 관심종목 기준
+- 검색 중에는 급상승 Top-20 섹션을 화면에서 숨긴다. 전체 기준 지표를 검색 결과와
+  나란히 두면 사용자가 "검색 집합의 순위"로 오해할 수 있어, 검색 모드에서는 결과
+  목록에 집중시킨다.
 
 요약 영역은 "현재 검색 결과의 부분 통계"가 아니라 "전체 관심종목 상태"를 보여주는 영역으로 정의한다. 이 결정으로 검색어 입력이 고빈도 실시간 집계를 흔들지 않고, 시총 합계도 O(1) 증분 집계로 유지할 수 있다.
 
@@ -277,14 +308,23 @@ _subscription = repository.ticks.listen(
 
 ## 10. 화면 1 — 관심종목 목록
 
-목록 화면 구성:
+탭 없이 하나의 세로 스크롤로 구성한다. 실제 국내 증권 앱(관심종목 세로 리스트 +
+별도 실시간 랭킹 영역) 패턴을 따른다.
+
+고정 영역(스크롤 위):
 
 - 검색 입력
-- feed 오류 배너
-- 표시 종목 수
-- 전체 시가총액 합계
-- 전체 기준 등락률 Top-20
-- 관심종목 목록
+- feed 오류 배너 (에러 발생 시에만)
+- 요약: 표시 종목 수 + 전체 시가총액 합계
+
+스크롤 영역(하나의 `CustomScrollView`):
+
+- 급상승 Top-20 세로 순위 섹션 — 순위 번호(1~3위 강조), 기본 5개만 접어 두고
+  '더보기'로 20위까지 펼친다(화면 공간 절약). 100ms 요약 갱신에 맞춰 순위가 바뀐다.
+- 전체 관심종목 목록 (코드순 고정, 컴팩트 행)
+
+검색 중에는 급상승 섹션을 숨기고 "검색 결과 N종목" 헤더 + 결과 목록만 보여준다.
+요약 지표(시총·Top-20)는 전체 기준이므로 검색 결과 부분집합과 섞지 않는다.
 
 각 행 표시:
 
@@ -304,7 +344,7 @@ _subscription = repository.ticks.listen(
 
 ## 11. 화면 2 — 상세
 
-화면 2는 화면 1보다 우선순위가 낮다. 구현한다면 동일 feed를 새로 구독하지 않고, 같은 store에서 선택 종목 notifier 하나만 listen한다.
+화면 2는 동일 feed를 새로 구독하지 않고, 같은 store에서 선택 종목 셀(`QuoteCell`) 하나만 listen한다.
 
 표시 정보:
 
