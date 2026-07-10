@@ -44,6 +44,7 @@ lib/
     top_movers_section.dart  급상승 Top-20 세로 순위 섹션(더보기 접힘)
     detail_page.dart
     sparkline.dart
+    format.dart              숫자·등락률 포매팅, 등락 색상
   baseline/
     naive_watchlist_page.dart  성능 비교용 순진한 구현(PERF.md)
 integration_test/perf_test.dart  기기 profile 프레임 측정
@@ -172,8 +173,8 @@ for (final tick in batch) {
 
 Flutter 레벨 수단:
 
-- 목록은 `ListView.builder`를 사용한다.
-- 각 행은 자기 종목 `QuoteCell`만 `AnimatedBuilder` 또는 `ListenableBuilder`로 listen한다.
+- 목록은 `CustomScrollView`의 `SliverFixedExtentList`로 lazy 빌드한다. 행 높이가 60으로 균일해 `itemExtent`를 고정하면 스크롤 위치의 표시 행 인덱스를 산술로 바로 구한다. 급상승 섹션과 목록을 한 스크롤로 묶기 위해 `ListView.builder` 대신 sliver 구조를 쓴다.
+- 각 행은 자기 종목 `QuoteCell`만 `ListenableBuilder`로 listen한다.
 - 행은 `RepaintBoundary`로 감싼다.
 - 가격, 거래량, 상태가 실제로 바뀌지 않은 tick은 notify하지 않는다.
 - 화면 밖 행은 위젯과 listener가 없으므로 offscreen 갱신이 visible row rebuild를 유발하지 않는다.
@@ -203,7 +204,7 @@ totalMarketCap += delta
 
 따라서 tick당 O(1)로 집계가 유지된다. 거래정지 tick처럼 가격이 변하지 않는 경우에는 delta가 0이고, 불필요한 summary 갱신도 생략할 수 있다.
 
-단, 전체 시총 합계는 값의 규모가 크다. 종목당 시총은 대략 `현재가 * 상장주식수`이고, 전체 합계는 `double`의 정수 정밀 한계를 넘을 수 있다. 증분 갱신 자체는 유지하되, 장시간 세션에서 부동소수점 오차가 누적되지 않도록 10초마다 전체 2,000개를 한 번 재합산해 보정한다. O(2,000) 비용은 10초 주기에서는 무시할 수 있다.
+단, 전체 시총 합계는 값의 규모가 크다. 종목당 시총은 대략 `현재가 * 상장주식수`이고, 전체 합계는 `double`의 정수 정밀 한계를 넘을 수 있다. 증분 갱신 자체는 유지하되, 장시간 세션에서 부동소수점 오차가 누적되지 않도록 600배치마다 전체 2,000개를 한 번 재합산해 보정한다(기본 60Hz에서 약 10초 주기). 벽시계 타이머가 아니라 배치 카운트를 기준으로 두어 `pump()` 벤치에서도 보정 시점이 결정론적으로 재현된다. O(2,000) 비용은 이 주기에서는 무시할 수 있다.
 
 ### Top-20
 
@@ -355,9 +356,9 @@ _subscription = repository.ticks.listen(
 - 관측 기준 고가와 저가
 - 최근 가격 흐름 스파크라인
 
-시가·고가·저가는 feed snapshot에 명확한 장 시작 값이 없으므로 "앱 구독 시작 이후의 관측값"으로 정의한다. tick 반영 시 전 종목에 대해 고가·저가를 함께 갱신한다. tick당 비교 2회만 추가되므로 비용은 작고, 상세 화면을 언제 열어도 같은 기준의 값을 보여줄 수 있다.
+고가·저가는 feed snapshot에 명확한 장 시작 값이 없으므로 "앱 구독 시작 이후의 관측값"으로 정의한다. 이 두 값은 전 종목에 대해 매 tick 셀에서 함께 갱신한다(`QuoteCell.applyTick`). tick당 비교 2회만 추가되므로 비용은 작고, 상세 화면을 언제 열어도 같은 기준의 고가·저가를 보여줄 수 있다.
 
-스파크라인은 무한히 커지는 리스트를 쓰지 않는다. 최근 120개 가격만 ring buffer로 유지하고, `CustomPaint`로 그린다.
+스파크라인은 성격이 다르다. 전 종목의 가격 이력을 상시 보관하면 2,000개 × 120개 버퍼가 되므로, 이력은 **상세 화면을 연 동안에만** 그 화면의 state에서 수집한다. 상세 화면 진입 시점부터 셀을 listen하며 최근 120개 가격만 `ListQueue` ring buffer로 유지하고 `CustomPaint`로 그린다. 따라서 스파크라인은 화면을 연 이후 흐름을 보여주며, 열자마자에는 짧게 시작해 점차 채워진다. 전 종목 이력을 들고 있지 않으므로 메모리 비용이 목록 규모와 무관하다.
 
 ## 12. 코드에서 주의할 함정
 
